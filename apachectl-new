@@ -1,0 +1,634 @@
+#!/bin/bash
+#############################################################################
+# Cree par Macfly #
+# Script de demarrage d'apache #
+#############################################################################
+# chkconfig: 2345 70 20
+# description: Starts and stops Apache
+
+PROG_NAME="$(basename "$0")"
+PROG_DIR="/usr/sbin"
+PROG_VERSION="0.0.6"
+APACHE_INSTANCE=$(basename "$0"|cut -d'-' -f2)
+
+# Parametres de configuration
+APACHECTL="/usr/sbin/httpd-$APACHE_INSTANCE"
+APACHELOGDIR="/home/logs/apache"
+
+# Demande d'entree utilisateur
+# $1 : Chaine de Prompt
+# $2 : Time out du prompt
+# $3 : Choix par defaut
+commonInputRead () {
+
+local prompt="$1"
+local timeout="$2"
+local defaultValue="$3"
+local choice
+unset commonInputReturnChoice
+
+[ -n "$timeout" ] && timeout="-t$timeout"
+
+echo -n "$prompt [$defaultValue] > "
+read $timeout choice
+
+if [ -z "$choice" ]; then
+commonInputReturnChoice="$defaultValue"
+else
+commonInputReturnChoice="$choice"
+fi
+}
+
+# Verifie si un chemin est absolue
+# $1 : Chemin a verfier
+commonCheckIsAbsolutePath () {
+
+local path="$1"
+local return
+
+if expr "$path" : / >/dev/null; then
+return=0
+else
+return=1
+fi
+
+return $return
+
+}
+
+
+# Permet de remplacer une chaine de carachtere par une patern
+# $1 : repertoire dans lequel rechercher
+# $2 : pattern a chercher
+# $3 : chaine a mettre en place
+commonReplacePath () {
+
+local path="$1"
+local pattern="$2"
+local string="$3"
+
+if [ -f "$path" -o -d "$path" ]; then
+
+find "$path" -type f | while read file; do
+  sed -i "s#$pattern#$string#g" "$file"
+done
+
+else
+return "1"
+fi
+
+}
+
+# Permet de trouver le fichier a l'origine d'un lien meme si celui-ci est un lien de lien
+# $1 : lien a verifier
+commonFindLinkFather() {
+
+local link="$1"
+local return=0
+
+if [ -h "$link" ]; then
+linkFather="$(ls -l "$link"  | awk '{print $NF}')"
+if ! commonCheckIsAbsolutePath "$linkFather"; then
+  linkFather="$(dirname $link)/$linkFather"
+fi
+commonFindLinkFather "$linkFather"
+return=$?
+else
+echo "$link"
+fi
+
+}
+
+
+# Fonction ameliorer de select
+# $1 : Chaine de prompt
+# $2 : timeout du prompt (si vide pas de time out)
+# $3 : Choix par defaut
+# $x : Liste des choix
+commonInputChoice () {
+
+local defaultValue choice count elt
+local prompt=$1
+local timeout=$2
+local defaultChoice=$3
+
+shift 3
+
+# List element
+count=1
+IFS=$'\n'
+for elt in $@; do
+
+if [ "$count" = "$defaultChoice" ]; then
+  defaultValue=$elt
+fi
+
+if [ -z "$defaultValue" -a "$elt" = "$defaultChoice" ]; then
+  defaultChoice=$count
+  defaultValue=$elt
+fi
+
+echo "$count) $elt"
+count=$(( $count + 1 ))
+done
+
+[ -n "$timeout" ] && timeout="-t$timeout"
+
+echo -n "$prompt [$defaultValue] > "
+read $timeout choice
+
+[ -z "$choice" ] && choice=$defaultChoice
+
+# Select element
+count=1
+for elt in $@; do
+[ "$count" = "$choice" ] && commonInputReturnChoice=$elt
+count=$(( $count + 1 ))
+done
+
+}
+
+
+
+
+# Affiche l'aide
+# $1 : commande sur laquelle port l'aide
+apachectlHelp () {
+
+	local fonction="$1"
+
+	case "$fonction" in
+		# Start/Stop/Restart/Graceful
+		start|stop|stop-start|restart|graceful|graceful-stop)
+			echo " -> $PROG_NAME $fonction (fichier de configuration)"
+		;;
+		# Configtest
+		configtest)
+			echo " -> $PROG_NAME $fonction (fichier de configuration)"
+			echo " Verifie la syntaxe de la configuration par defaut sauf si la configuration a ete en parametre"
+		;;
+		status)
+			echo " -> $PROG_NAME $fonction"
+			echo " Affiche un etat minimaliste du serveur, facilement parsable"
+		;;
+		fullstatus)
+			echo " -> $PROG_NAME $fonction"
+			echo " Affiche l'etat complet du serveur web"
+		;;
+		# Autres
+		*)
+			echo " Utilisation: $PROG_NAME [-defhilv]" action parametres ...
+			echo " -d [0...x] Niveau de debug affiche sur la sortie standard"
+			echo " -e Specifie ou est redirige la sortie d'erreur"
+			echo " display : sur la sortie standard"
+			echo " file : dans le fichier de log"
+			echo " off  : nul part"
+			echo " -f [ERR,WARN,INFO,DEBUG] Specifie le niveau du filtre a l'affichage"
+			echo " -h Affiche cette aide"
+			echo " -i [0...x] Niveau de debug dans le fichier de log"
+			echo " -l [ERR,WARN,INFO,DEBUG] Specifie le niveau du filtre dans le fichier de log"
+			echo " -v Affiche la version du script et du package"
+			echo
+		;;
+	esac
+
+}
+
+apachectlExit () {
+
+	local return="$1"
+	local level="$2"
+	shift 2
+
+	#find "$PROG_DIR/logs/" -type f -name 'apachectl-*.log' -mtime +30 -exec rm -f {} \;
+exit $return
+
+}
+
+arrayMaxLineSize () {
+local count=$#
+local max=0
+for ((i=0;i<$count;i=i+1)); do
+[ $max -lt ${#1} ] && max="${#1}"
+shift
+done
+echo "$max"
+}
+
+###############################################################################
+#Gestion de la configuration #
+###############################################################################
+
+# Affiche la configuration
+# $1 : Racine du serveur apache
+# $2 : Fichier de configuration
+# $3 : Niveau de recursion
+# $4 : Affichage des include ou pas (on|off)
+
+# Permet de convertir les logs non pipe en piped Log
+#echo "$line" | sed -e 's!\(^ *\(\(Script\|Forensic\|SSL\|Rewrite\|Custom\|Transfer\|Cookie\|\(Err\)or\)\+Log\|JkLogFile\) \+\)["'']\?\([^|"'' ]\+/\)\?\([^|/"'' ]\+\)["'']\?\( \+[^ ]\+\)\?!\1 "|/usr/local/linkbynet/apache/bin/rotatelogs \5\L\4\E-%Y%m%d-%H%M.log 86400"\7!Ig' -e 's!/-!/!g'
+
+# Verifie l'existence des repertoires de log
+# $1 : Racine du serveur
+# $2 : Fichier de configuration
+configLogCheck () {
+
+local serverRoot="$1"
+local configFile="$2"
+local md5File="$configFile.md5"
+
+if [ -f "$md5File" ]; then
+if md5sum -c "$md5File" --status; then
+  return 0
+else
+  rm -f "$md5File"
+fi
+fi
+
+configLogCheck2 "$serverRoot" "$configFile" "$md5File"
+return="$?"
+
+return $return
+
+}
+
+CONFIGLOGCHECK=''
+
+# Verifie l'existence des repertoires de log
+# $1 : Racine du serveur
+# $2 : Fichier de configuration
+# $3 : Fichier contenant les md5
+configLogCheck2 () {
+
+quit() {
+[ -f "$md5File" ] && rm -f "$md5File"
+exit 1
+}
+
+	trap quit QUIT HUP KILL TERM INT
+
+	local serverRoot="$1"
+local configFile="$2"
+	local md5File="$3"
+	local absolutePath
+
+if [ -f "$configFile" ]; then
+		IFS=$'\x0A'
+
+
+		for logDir in $(sed -n -e 's!\(^ *\(\(Script\|Forensic\|SSL\|Rewrite\|Custom\|Transfer\|Cookie\|Error\|Jk\)\+Log\|JkLogFile\) \+["'']\?\(\|[^"'' ]\+ \+\(-[a-z] \+\)\+\)\?\)\([^"'']\+/\)\?\([^"'' ]\+\)\([^/"'' ]\+["'']\?.*\)!\6!Ipg' "$configFile"); do
+	if [ ! -d "$logDir" ]; then
+	if [ "$interactif" = "on" ]; then
+	commonInputChoice "Faut-il creer le repertoire ($logDir)" "" "Yes" "$(echo -e "Yes\nNo")"
+	if [ "$commonInputReturnChoice" = "Yes" ]; then
+	  if mkdir -p "$logDir"; then
+	echo "Repertoire cree"
+	return=0
+	  else
+	echo "Echec a la creation"
+							[ -f "$md5File" ] && rm -f "$md5File"
+	return 1
+	  fi
+	else
+	  echo "Le repertoire n'a pas ete cree"
+						[ -f "$md5File" ] && rm -f "$md5File"
+	  return 1
+
+	fi
+	else
+	echo "Creation du repertoire de log $logDir"
+	mkdir -p "$logDir" || echo "Echec a la creation"
+	return="$?"
+	fi
+	else
+	return=0
+	fi
+		done
+
+
+		for include in $(sed -n -e 's!^ *include \+["'"'"']\?\([^"'"'"']\+\)["'"'"']\?!\1!Ipg' "$configFile"); do
+			if [ -d $include ]; then
+				echo "$include is a directory : skipping LogCheck verification" 
+				return 0
+			fi
+	echo "Verification: $include"
+	if echo -e "$CONFIGLOGCHECK" | grep "^$include\$" 1>/dev/null; then  
+	  return 0
+	else
+				if commonCheckIsAbsolutePath "$include"; then
+					absolutePath="$include"
+				else
+					absolutePath="$serverRoot/$include"
+				fi
+
+	  if ! configLogCheck2 "$serverRoot" "$absolutePath" "$md5File"; then
+					[ -f "$md5File" ] && rm -f "$md5File"
+	return 1
+	  else
+	CONFIGLOGCHECK="$CONFIGLOGCHECK\n$include"
+	  fi
+	fi
+		done
+
+		if grep 'FastCgiExternalServer' "$configFile" 1>/dev/null; then
+  DIRCONF=$(dirname $configFile)
+  fpmUser=$(echo $configFile | sed -r 's!.*/[^-]+.(.*).conf!\1!')
+  fpmConfFile=${DIRCONF}/php-${fpmUser}.conf
+  phpIniConfFile=${DIRCONF}/php.ini
+			#Check if substitution is OK (should be NOK if vhost name is not standard)
+			if [ "$fpmConfFile" == "$configFile" -o "$phpIniConfFile" == "$configFile" ]; then
+				echo "[ALERTE] Il y a un souci de nommage dans la config du vhost $(dirname $configFile). On ignore pour laisser le gracefull finir"
+				return 0
+			fi
+			if [ -f $fpmConfFile ]; then
+				XML=$(grep "^<?xml" $fpmConfFile)
+				if [ "x$XML" == "x" ]; then
+					phpFpm_error_log=$(grep error_log $fpmConfFile |grep -v "^;"|cut -d'=' -f2|sed -e 's/^ //g'|sed -e 's/ $//g')
+				else
+					phpFpm_error_log=$(grep error_log $fpmConfFile |grep -v "^;"|cut -d'>' -f2|cut -d'<' -f1|sed -e 's/^ //g'|sed -e 's/ $//g')
+				fi
+				if [ ! -f "${phpFpm_error_log}" ]; then
+					if [ "$interactif" = "on" ]; then
+						commonInputChoice "Faut-il creer le fichier (${phpFpm_error_log})" "" "Yes" "$(echo -e "Yes\nNo")"
+						if [ "$commonInputReturnChoice" = "Yes" ]; then
+							if touch "${phpFpm_error_log}" && chown ${fpmUser}:${fpmUser} ${phpFpm_error_log}; then
+								echo "Fichier cree"
+								return=0
+							else
+								echo "Echec a la creation"
+								[ -f "$md5File" ] && rm -f "$md5File"
+								return 1
+							fi
+						else
+							echo "Le fichier de log PHP n'a pas ete cree"
+							[ -f "$md5File" ] && rm -f "$md5File"
+							return 1
+						fi
+					else
+						echo "Creation du fichier de log ${phpFpm_error_log}"
+						touch "${phpFpm_error_log}" && chown ${fpmUser}:${fpmUser} ${phpFpm_error_log} || echo "Echec a la creation"
+						return="$?"
+					fi
+				fi
+				php_error_log=$(grep error_log $phpIniConfFile |grep -v "^;"|cut -d'=' -f2|sed -e 's/^ //g'|sed -e 's/ $//g')
+				if [ ! -f "${php_error_log}" ]; then
+					if [ "$interactif" = "on" ]; then
+						commonInputChoice "Faut-il creer le fichier (${php_error_log})" "" "Yes" "$(echo -e "Yes\nNo")"
+						if [ "$commonInputReturnChoice" = "Yes" ]; then
+							if touch "${php_error_log}" && chown ${fpmUser}:${fpmUser} ${php_error_log}; then
+								echo "Fichier cree"
+								return=0
+							else
+								echo "Echec a la creation"
+								[ -f "$md5File" ] && rm -f "$md5File"
+								return 1
+							fi
+						else
+							echo "Le fichier de log PHP n'a pas ete cree"
+							[ -f "$md5File" ] && rm -f "$md5File"
+							return 1
+						fi
+					else
+						echo "Creation du fichier de log ${php_error_log}"
+						touch "${php_error_log}" && chown ${fpmUser}:${fpmUser} ${php_error_log} || echo "Echec a la creation"
+						return="$?"
+					fi
+				fi
+			else
+				echo "Le fichier de config du pool FPM $fpmConfFile n'est pas present"
+				return 1
+			fi
+		fi
+
+else
+echo "$configFile: fichier introuvable"
+return=1
+fi
+
+if [ $return -eq 0 ]; then
+ md5sum "$configFile" >> "$md5File"
+else
+ [ -f "$md5File" ] && rm -f "$md5File"
+fi
+return $return
+
+}
+
+###############################################################################
+# Gestion d'apache  #
+###############################################################################
+
+# Permet d'arreter, relancer, demarrer apache
+# $1 : Fichier de configuration
+# $2 : action a realiser
+apachectl () {
+
+local serverConfRoot="$1"
+	local action="$2"
+	local configFile="$serverConfRoot/httpd.conf"
+	local return
+
+	if [ -f "$configFile" ]; then
+		# Verification de la configuration
+		if apachectlConfigtest "$configFile"; then
+			if configLogCheck "$(dirname $(dirname $(dirname "$serverConfRoot")))" "$configFile"; then
+				# Chargement du fichier d'environnement envvars
+				if [ -f "$serverConfRoot/envvars" ]; then
+					echo "Chargement de envvars"
+					. "$serverConfRoot/envvars"
+				else
+					echo "Pas de fichier envvars"
+				fi
+
+				# Declanchement de l'action
+				if $APACHECTL -k $action -f "$configFile"; then
+					echo "$action: Ok"
+					return=0
+				else
+					echo "$action: Echec"
+					return=1
+				fi
+  else
+echo "Repertoire de log manquant, $action annule"
+return=1
+  fi
+		else
+			echo "Configuration incorrecte, $action annule"
+			return=1
+		fi
+	else
+		echo "$configFile n'existe pas."
+		return=1
+	fi
+
+	return $return
+
+}
+
+# Verifie la configuration d'apache
+# $1 : Chemin du fichier de conf
+apachectlConfigtest () {
+
+	local return=0
+	local configFile="$1"
+
+	if $APACHECTL -t -f "$configFile" 1>&2  ; then
+		echo "Configuration correcte"
+		return=0
+	else
+		echo "WARN" "Configuration incorrecte"
+		return=1
+	fi
+
+	return $return
+
+}
+
+
+serverConfRoot () {
+
+	if [ -n "$apacheIpPort" ]; then
+		if [ -d "$PROG_DIR/conf/instances/httpd-$apacheIpPort" ]; then
+			serverConfRoot="$PROG_DIR/conf/instances/httpd-$apacheIpPort"
+		else
+			# La configuration n'existe pas
+			if [ "$interactif" = "off" ]; then
+				# TODO: Message dans le motd
+				apachectlExit 1 "ERR" "La configuration pour le serveur $apacheIpPort n'existe pas"
+			else
+				commonInputChoice "Serveur " "" "$(cd $PROG_DIR/conf/instances; ls -td1 httpd-[0-9\.]*\_[0-9]* | head -1)" "$(cd $PROG_DIR/conf/instances; ls -d1 httpd-[0-9\.]*\_[0-9]*)"
+				serverConfRoot="$PROG_DIR/conf/instances/$commonInputReturnChoice"
+			fi
+		fi
+	else
+		if [ "$interactif" = "off" ]; then
+			# TODO: Message dans le motd
+			apachectlExit 1 "ERR" "La configuration pour le serveur $apacheIpPort n'existe pas"
+		else
+			local list="$(cd $PROG_DIR/conf/instances; ls -d1 httpd-[0-9\.]*\_[0-9]*)"
+			local count="$(echo "$list" | wc -l | awk '{print $1}')"
+
+			if [ $count -le 0 ]; then
+				apachectlExit 1 "ERR" "Pas de configuration"
+			elif [ $count -eq 1 ]; then
+				commonInputReturnChoice="$list"	
+			elif [ $count -gt 1 ]; then
+				commonInputChoice "Serveur " "" "$(cd $PROG_DIR/conf/instances; ls -td1 httpd-[0-9\.]*\_[0-9]* | head -1)" "$list"
+			fi
+
+			serverConfRoot="$PROG_DIR/conf/instances/$commonInputReturnChoice"
+		fi
+	fi
+
+	[ ! -d "$serverConfRoot" ] && apachectlExit 1 "ERR" "Configuration non valide"
+
+}
+###############################################################################
+#Corps du programme #
+###############################################################################
+
+unalias -a
+
+# On parse les arguments 
+while getopts "d:e:f:hi:l:v" arg; do
+case $arg in
+d ) LOG_DISPLAY_LEVEL="$OPTARG";;
+e ) LOG_STDERR="$OPTARG";;
+f ) LOG_DISPLAY_FILTER="$OPTARG";;
+h ) apachectlHelp;;
+i ) LOG_FILE_FILTER="$OPTARG";;
+l ) LOG_FILE_LEVEL="$OPTARG";;
+v ) echo "Version $PROG_VERSION"
+ exit 0;;
+* ) echo "Unimplemented option chosen.";;
+esac
+done
+
+shift $(($OPTIND - 1))
+
+# Verification de la methode d'appel du scrit lien ou direct
+if [ -h "$0" ]; then
+	PROG_DIR="$(dirname $(dirname $(commonFindLinkFather $0)))"
+	apacheIpPort=${PROG_NAME##*-}
+else
+	PROG_DIR="$(dirname $PROG_DIR)"	
+fi 
+
+# Affiche l'aide global
+if [ $# -eq 0 ]; then
+	for help in start stop stop-start restart graceful graceful-stop configtest \
+		status fullstatus other; do
+		apachectlHelp "$help"
+	done
+	apachectlExit 1 "ERR" "Aucun parametre fournis"
+fi
+
+action="$1"
+shift
+
+# On regarde si on est en mode interractif ou non
+#if stty size &>/dev/null; then
+if stty size &>/dev/null && [ "$TERM" != "linux" ]; then
+	interactif="on"
+else
+ 	interactif="off"
+fi
+
+
+if [ -d "$PROG_DIR/conf/instances/httpd-$apacheIpPort/sites" ]; then
+	vhostConfRoot="$PROG_DIR/conf/instances/httpd-$apacheIpPort/sites"
+else
+	apachectlExit 1 "ERR" "Le repertoire $PROG_DIR/conf/instances/httpd-$apacheIpPort/sites n'existe pas, une erreur a du se produire durant l'installation du serveur, merci de verifier celle-ci"
+fi
+
+# Lancement de l'action demandee
+case "$action" in
+	# Start/Stop/Restart/Graceful
+	start|stop|restart|graceful|graceful-stop)
+		serverConfRoot
+		#[ "$action" == "start" ] && vhostStatus "$serverConfRoot" "$vhostConfRoot" all
+		apachectl "$serverConfRoot" "$action"
+		apachectlExit $?
+	;;
+	stop-start)
+serverConfRoot
+apachectl "$serverConfRoot" "stop" && apachectl "$serverConfRoot" "start"
+apachectlExit $?
+	;;
+	# Configtest
+	configtest)
+if [ $# -gt 0 ]; then
+			apachectlConfigtest "$1"
+else
+			serverConfRoot
+			apachectlConfigtest "$serverConfRoot/httpd.conf"
+fi
+		apachectlExit $?
+	;;
+	status|fullstatus)
+		if which lynx 1>/dev/null; then
+			serverConfRoot
+			statusIp=${serverConfRoot##*-}
+			STATUSURL="http://${statusIp/_/:}/lbn_admin/server-status"
+			case "$action" in
+				status)
+					lynx -dump --width=300 "$STATUSURL?auto"
+					#lynx -dump $STATUSURL | awk ' /process$/ { print; exit } { print } '
+				;;
+				fullstatus)
+					lynx -dump --width=300 $STATUSURL
+				;;
+			esac
+		else
+			echo "La commande Lynx n'a pas ete trouve"
+		fi
+		apachectlExit $?
+	;;
+	# Autres
+	*) 
+		#echo "Action inconnue $action ($PROG_NAME $action $@)"
+		#$APACHECTL $action $@
+		$action $@
+		apachectlExit $?
+	;;
+esac
