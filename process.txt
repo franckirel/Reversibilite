@@ -1,0 +1,9 @@
+Apache:
+Suppression du fichier /etc/lbn/httpd/script/apacheInstance
+                       /etc/lbn/httpd/script/cleanLogsApache
+remplacement du fichier /etc/lbn/httpd/script/apachectl
+
+Mysql
+https://wiki.linkbynet.com/softs:mysqllbn:install:prerequismysql
+mv /usr/local/linkbynet/script/mysql /home/nobackup/mysql-`date '+%Y-%m-%d_%H:%M:%S'` ; rm -f /usr/local/linkbynet/script/bin/BackupMySQL.sh ; rm -f /usr/local/linkbynet/script/bin/mysql-list ; rm -f /usr/local/linkbynet/script/bin/mysqltuner.pl ; rm -f /usr/local/linkbynet/script/bin/tuning-primer.sh ; rm -f /usr/local/linkbynet/script/sbin/snapshot.pl ; rm -f /usr/local/linkbynet/script/sbin/RestoreMySQL.pl
+yum remove lbn-script-mysql
